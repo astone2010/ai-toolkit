@@ -100,7 +100,17 @@ def ensure_venv(spec, dry_run=False):
         # recreate it rather than install unresolvable wheels into it.
         want = _uv_python_platform(spec.uv_python)
         have = _venv_platform()
-        if want and have and want != have:
+        wanted_python = spec.python_version
+        have_python = venv_python_version()
+        wrong_platform = want and have and want != have
+        wrong_python = have_python and have_python != wanted_python
+        if wrong_python and not wrong_platform:
+            have = "Python %s" % have_python
+            want = "Python %s" % wanted_python
+        elif wrong_python:
+            have = "%s, Python %s" % (have, have_python)
+            want = "%s, Python %s" % (want, wanted_python)
+        if wrong_platform or wrong_python:
             if dry_run:
                 info(
                     "[dry-run] venv is %s but this spec needs %s — would "

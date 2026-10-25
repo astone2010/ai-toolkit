@@ -3,7 +3,7 @@ import { Job } from '@prisma/client';
 import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
-import { TOOLKIT_ROOT, getTrainingFolder, getHFToken } from '../paths';
+import { TOOLKIT_ROOT, getTrainingFolder, getHFToken, getModelsPath } from '../paths';
 import { resolveDetachedPythonPath } from '../pythonPath';
 const isWindows = process.platform === 'win32';
 
@@ -217,6 +217,14 @@ const startAndWatchJob = (job: Job) => {
     // update the config dataset path
     const jobConfig = JSON.parse(job.job_config);
     jobConfig.config.process[0].sqlite_db_path = path.join(TOOLKIT_ROOT, 'aitk_db.db');
+    if (job.job_type === 'inference') {
+      // the engine publishes engine.json (endpoint + token) and writes its
+      // outputs under the job folder, which the UI proxy/file routes know
+      jobConfig.config.process[0].engine = {
+        ...(jobConfig.config.process[0].engine || {}),
+        job_folder: trainingFolder,
+      };
+    }
 
     // write the config file
     fs.writeFileSync(configPath, JSON.stringify(jobConfig, null, 2));
@@ -248,6 +256,15 @@ const startAndWatchJob = (job: Job) => {
     const hfToken = await getHFToken();
     if (hfToken && hfToken.trim() !== '') {
       additionalEnv.HF_TOKEN = hfToken;
+    }
+
+    // MODELS_PATH - one set in the env always takes precedence (it passes
+    // through via process.env); only fall back to the setting if it is not set
+    if (!process.env.MODELS_PATH || process.env.MODELS_PATH.trim() === '') {
+      const modelsPath = await getModelsPath();
+      if (modelsPath && modelsPath.trim() !== '') {
+        additionalEnv.MODELS_PATH = modelsPath;
+      }
     }
 
     const args = [runFilePath, configPath];

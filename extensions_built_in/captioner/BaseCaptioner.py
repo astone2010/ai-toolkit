@@ -3,6 +3,7 @@ from collections import OrderedDict
 
 import sqlite3
 import os
+import re
 from typing import Literal, Optional
 import threading
 import time
@@ -17,6 +18,10 @@ import tqdm
 from toolkit.train_tools import get_torch_dtype
 
 AITK_Status = Literal["running", "stopped", "error", "completed"]
+
+# prompt special token: <caption.ext> -> contents of the media file's sibling <stem>.ext.
+# ext is dot-separated alphanumeric segments only: no separators, no empty segments (..)
+_CAPTION_TOKEN_RE = re.compile(r"<caption\.([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)>")
 
 
 class CaptionConfig:
@@ -45,6 +50,17 @@ class CaptionConfig:
             "caption_prompt", "Describe this image in detail."
         )
         self.compile = kwargs.get("compile", False)
+        # batched captioners: files generated per model.generate call, and CPU
+        # preprocessing threads that keep the GPU fed. Default 1 for VRAM
+        # safety; raise it to saturate a large GPU.
+        self.batch_size = kwargs.get("batch_size", 1)
+        self.num_workers = kwargs.get("num_workers", 3)
+        # stream weights from CPU per layer instead of keeping them resident
+        # (low-vram machines); percent is the fraction of linears offloaded
+        self.layer_offloading = kwargs.get("layer_offloading", False)
+        self.layer_offloading_percent = kwargs.get("layer_offloading_percent", 1.0)
+        # [{path, strength, name}] applied as sidechains, never merged
+        self.loras = kwargs.get("loras", None) or []
 
 
 class BaseCaptioner(BaseExtensionProcess):
@@ -80,6 +96,7 @@ class BaseCaptioner(BaseExtensionProcess):
 
         self.caption_config = self.caption_config_class(**self.get_conf("caption", {}))
         self.model = None
+        self.lora_stack = None
         self.processor = None
         self.model2 = None
         self.processor2 = None
@@ -94,6 +111,7 @@ class BaseCaptioner(BaseExtensionProcess):
             self.start_stop_watcher()
             self.update_status("running", "Loading Model")
             self.load_model()
+            self.load_loras()
             self.maybe_compile_models()
             self.update_status("running", "Looking for files")
             self.find_files()
@@ -139,6 +157,28 @@ class BaseCaptioner(BaseExtensionProcess):
                 image = image.resize((new_width, new_height), resample=Image.BICUBIC)
         return image
 
+    def resolve_prompt(self, prompt: Optional[str], file_path: str) -> Optional[str]:
+        """Expand special tokens in a caption prompt for one media file. <caption.ext>
+        becomes the text of <stem>.ext next to the file (json included, inserted as-is),
+        or blank when that file does not exist."""
+        if not prompt or "<caption." not in prompt:
+            return prompt
+        media_dir = os.path.dirname(os.path.abspath(file_path))
+        stem = os.path.splitext(os.path.basename(file_path))[0]
+
+        def sub(m):
+            target = os.path.join(media_dir, f"{stem}.{m.group(1)}")
+            # only a file sitting next to the media file is ever read
+            if os.path.dirname(os.path.abspath(target)) != media_dir:
+                return ""
+            try:
+                with open(target, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+            except OSError:
+                return ""
+
+        return _CAPTION_TOKEN_RE.sub(sub, prompt)
+
     def save_caption_for_file(self, file_path: str, caption: str):
         filename_no_ext = os.path.splitext(file_path)[0]
         caption_file_path = f"{filename_no_ext}.{self.caption_config.caption_extension}"
@@ -158,7 +198,8 @@ class BaseCaptioner(BaseExtensionProcess):
     def find_files(self):
         # recursivly find all the files in the path_to_caption with the specified extensions and save the paths to self.file_paths
         for root, dirs, files in os.walk(self.caption_config.path_to_caption):
-            dirs[:] = [d for d in dirs if d != "_controls"]
+            # skip _controls and hidden dirs (.thumbs, .tmp)
+            dirs[:] = [d for d in dirs if d != "_controls" and not d.startswith(".")]
             for file in files:
                 if any(
                     file.lower().endswith(f".{ext}") and not file.startswith(".")
@@ -191,6 +232,28 @@ class BaseCaptioner(BaseExtensionProcess):
 
     def load_model(self):
         raise NotImplementedError("Model loading not implemented for this captioner")
+
+    def load_loras(self):
+        """Attach the configured LoRAs to self.model as forward-hook sidechains
+        (the inference engine's hook mode): the low-rank branch runs alongside
+        the layer in the model's compute dtype and the base weights are never
+        touched, so quantized weights stay on their grid and nothing is merged."""
+        specs = [
+            l for l in self.caption_config.loras if isinstance(l, dict) and l.get("path")
+        ]
+        if not specs or self.model is None:
+            return
+        from toolkit.inference_lora import LoRAStack
+
+        # self is the holder: LoRAStack reads .model (and .text_encoder, unused here)
+        stack = LoRAStack(self, mode="hook").load(
+            specs, status_fn=self.print_and_status_update
+        )
+        stack.apply(status_fn=self.print_and_status_update)
+        self.lora_stack = stack
+        self.print_and_status_update(
+            f"Applied {len(stack.loras)} LoRA(s) as sidechains"
+        )
 
     def maybe_compile_models(self):
         if not self.caption_config.compile:
